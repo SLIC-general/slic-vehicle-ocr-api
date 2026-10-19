@@ -48,14 +48,42 @@ builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
-// CORS for Frontend
+// ==========================================
+// UPDATED CORS CONFIGURATION
+// Reads from .env and allows localhost wildcards
+// ==========================================
+var allowedOrigins = (Environment.GetEnvironmentVariable("ALLOWED_ORIGINS") ?? "http://localhost:3000")
+    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+static bool IsAllowedOrigin(string origin, string[] allowed)
+{
+    foreach (var entry in allowed)
+    {
+        if (string.Equals(entry, origin, StringComparison.OrdinalIgnoreCase)) return true;
+        if (entry.EndsWith(":*", StringComparison.Ordinal))
+        {
+            var prefix = entry[..^1]; // e.g., "http://localhost:"
+            if (origin.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+                && int.TryParse(origin[prefix.Length..], out _)) return true;
+        }
+    }
+    return false;
+}
+
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowFrontend", policy =>
     {
-        policy.WithOrigins("http://localhost:3000", "http://127.0.0.1:3000")
-              .AllowAnyHeader()
-              .AllowAnyMethod();
+        if (allowedOrigins.Contains("*"))
+        {
+            policy.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod();
+        }
+        else
+        {
+            policy.SetIsOriginAllowed(o => IsAllowedOrigin(o, allowedOrigins))
+                  .AllowAnyHeader()
+                  .AllowAnyMethod();
+        }
     });
 });
 
