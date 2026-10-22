@@ -48,6 +48,7 @@ builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
+
 // CORS - Allow all frontend origins
 builder.Services.AddCors(options =>
 {
