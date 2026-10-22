@@ -1,8 +1,8 @@
 using Docnet.Core;
 using Docnet.Core.Converters;
 using Docnet.Core.Models;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
+
+using SkiaSharp;
 using VehicleOcr.Api.Config;
 using VehicleOcr.Api.Dtos;
 
@@ -34,7 +34,8 @@ public class QualityCheckService : IQualityCheckService
 
         try
         {
-            Image<Rgba32> image;
+            SKBitmap bitmap;
+
             if (contentType.Equals("application/pdf", StringComparison.OrdinalIgnoreCase))
             {
                 var scaling = 300.0 / 72.0;
@@ -55,17 +56,23 @@ public class QualityCheckService : IQualityCheckService
                 int height = pageReader.GetPageHeight();
                 var rawBytes = pageReader.GetImage(new NaiveTransparencyRemover(255, 255, 255));
 
-                using var bgra = Image.LoadPixelData<Bgra32>(rawBytes, width, height);
-                image = bgra.CloneAs<Rgba32>();
+                // Docnet returns BGRA bytes; wrap in an SKBitmap
+                var info = new SKImageInfo(width, height, SKColorType.Bgra8888, SKAlphaType.Premul);
+                bitmap = new SKBitmap(info);
+                System.Runtime.InteropServices.Marshal.Copy(rawBytes, 0, bitmap.GetPixels(), rawBytes.Length);
             }
             else
             {
-                image = Image.Load<Rgba32>(fileBytes);
+                bitmap = SKBitmap.Decode(fileBytes);
+                if (bitmap == null)
+                {
+                    throw new InvalidOperationException("Could not decode image");
+                }
             }
 
-            using (image)
+            using (bitmap)
             {
-                return Task.FromResult(EvaluateImage(image));
+                return Task.FromResult(EvaluateImage(bitmap));
             }
         }
         catch (Exception ex)
@@ -81,10 +88,10 @@ public class QualityCheckService : IQualityCheckService
         }
     }
 
-    private QualityResult EvaluateImage(Image<Rgba32> image)
+    private QualityResult EvaluateImage(SKBitmap bitmap)
     {
-        int w = image.Width;
-        int h = image.Height;
+        int w = bitmap.Width;
+        int h = bitmap.Height;
         var reasons = new List<string>();
 
         // 1. Resolution: min 800x600 -> else penalise
@@ -97,21 +104,21 @@ public class QualityCheckService : IQualityCheckService
             reasons.Add($"resolution={w}x{h} (below {_options.MinWidth}x{_options.MinHeight})");
         }
 
-        // Grayscale conversion
+        // Grayscale conversion from BGRA bytes
         byte[] gray = new byte[w * h];
-        image.ProcessPixelRows(accessor =>
+        var pixels = bitmap.GetPixelSpan();
+        for (int y = 0; y < h; y++)
         {
-            for (int y = 0; y < accessor.Height; y++)
+            int rowOffset = y * w;
+            for (int x = 0; x < w; x++)
             {
-                var row = accessor.GetRowSpan(y);
-                int offset = y * w;
-                for (int x = 0; x < row.Length; x++)
-                {
-                    var p = row[x];
-                    gray[offset + x] = (byte)(0.299f * p.R + 0.587f * p.G + 0.114f * p.B);
-                }
+                int i = (rowOffset + x) * 4;
+                byte b = pixels[i];
+                byte g = pixels[i + 1];
+                byte r = pixels[i + 2];
+                gray[rowOffset + x] = (byte)(0.299f * r + 0.587f * g + 0.114f * b);
             }
-        });
+        }
 
         // 2. Brightness & Contrast
         double sum = 0;
