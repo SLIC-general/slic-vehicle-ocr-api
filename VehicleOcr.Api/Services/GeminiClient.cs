@@ -111,37 +111,11 @@ Return the final extraction as a JSON object matching this structure.";
             throw new GeminiException("GEMINI_API_KEY configuration is missing or empty.");
         }
 
-        // Read and serialize request body in memory ONCE at the start
         var base64Data = Convert.ToBase64String(fileBytes);
-        var requestPayload = new
-        {
-            contents = new[]
-            {
-                new
-                {
-                    parts = new object[]
-                    {
-                        new
-                        {
-                            inline_data = new
-                            {
-                                mime_type = mimeType,
-                                data = base64Data
-                            }
-                        },
-                        new
-                        {
-                            text = PromptText
-                        }
-                    }
-                }
-            },
-            generationConfig = new
-            {
-                response_mime_type = "application/json"
-            }
-        };
-        var jsonBytes = JsonSerializer.SerializeToUtf8Bytes(requestPayload);
+        var model = _options.Model;
+
+        // Build the payload ONCE using the new helper method
+        var jsonBytes = BuildPayload(model, mimeType, base64Data);
 
         var totalDeadline = DateTime.UtcNow.AddSeconds(_options.TotalTimeoutSeconds);
         var primaryModel = _options.Model;
@@ -164,7 +138,6 @@ Return the final extraction as a JSON object matching this structure.";
 
             var endpoint = $"https://generativelanguage.googleapis.com/v1beta/models/{primaryModel}:generateContent";
 
-            // Rebuild HttpRequestMessage and fresh ByteArrayContent on every attempt
             using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
             request.Headers.Add("x-goog-api-key", apiKey);
             request.Content = new ByteArrayContent(jsonBytes);
@@ -185,19 +158,16 @@ Return the final extraction as a JSON object matching this structure.";
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                // Caller cancelled -> stop immediately (no retry)
                 throw;
             }
             catch (OperationCanceledException)
             {
-                // Per-attempt timeout fired -> treat as transient
                 isTransient = true;
                 statusCode = 504;
                 errorMessage = $"Request to Gemini API timed out after {_options.TimeoutSeconds} seconds.";
             }
             catch (HttpRequestException ex)
             {
-                // Network error (connection reset, DNS, etc.)
                 isTransient = true;
                 statusCode = 503;
                 errorMessage = $"Network error when communicating with Gemini API: {ex.Message}";
@@ -224,10 +194,15 @@ Return the final extraction as a JSON object matching this structure.";
                         isTransient = true;
                         errorMessage = $"Gemini API returned transient error (HTTP {statusCode}).";
                         retryAfterDelay = ParseRetryAfter(response);
+
+                        // NEW: Read and log Google's exact error message
+                        var transientBody = await response.Content.ReadAsStringAsync(cancellationToken);
+                        _logger.LogWarning("Gemini transient {Status} from {Model}: {Body}",
+                            statusCode, primaryModel,
+                            transientBody.Length > 500 ? transientBody[..500] : transientBody);
                     }
                     else
                     {
-                        // Permanent error (400, 401, 403, 404, etc.) -> DO NOT retry
                         var errorBody = await response.Content.ReadAsStringAsync(cancellationToken);
                         _logger.LogError("Gemini API error [{Status}]", statusCode);
                         throw new GeminiException($"Gemini API error (HTTP {statusCode}): {errorBody}", statusCode);
@@ -254,14 +229,8 @@ Return the final extraction as a JSON object matching this structure.";
                     }
 
                     var maxBackoff = TimeSpan.FromMilliseconds(_options.MaxBackoffMs);
-                    if (delay > maxBackoff)
-                    {
-                        delay = maxBackoff;
-                    }
-                    if (delay < TimeSpan.Zero)
-                    {
-                        delay = TimeSpan.Zero;
-                    }
+                    if (delay > maxBackoff) delay = maxBackoff;
+                    if (delay < TimeSpan.Zero) delay = TimeSpan.Zero;
 
                     var remainingTime = totalDeadline - DateTime.UtcNow;
                     if (remainingTime <= TimeSpan.Zero || delay > remainingTime)
@@ -287,7 +256,7 @@ Return the final extraction as a JSON object matching this structure.";
             }
         }
 
-        // All primary-model retries failed. Attempt fallback model if configured.
+        // Fallback Loop
         if (!string.IsNullOrWhiteSpace(_options.FallbackModel))
         {
             var fallbackModel = _options.FallbackModel;
@@ -301,9 +270,14 @@ Return the final extraction as a JSON object matching this structure.";
 
             var fallbackEndpoint = $"https://generativelanguage.googleapis.com/v1beta/models/{fallbackModel}:generateContent";
 
+            // Build payload for fallback model
+            var fbBytes = BuildPayload(fallbackModel, mimeType, base64Data);
+
             using var fbRequest = new HttpRequestMessage(HttpMethod.Post, fallbackEndpoint);
             fbRequest.Headers.Add("x-goog-api-key", apiKey);
-            fbRequest.Content = new ByteArrayContent(jsonBytes);
+
+            // Use the fallback payload bytes here
+            fbRequest.Content = new ByteArrayContent(fbBytes);
             fbRequest.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
 
             using var fbAttemptCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -322,10 +296,8 @@ Return the final extraction as a JSON object matching this structure.";
 
                 if (!IsTransientStatusCode(fbResponse.StatusCode))
                 {
-                    // Fallback model failed with a permanent error (e.g., 404 wrong model name)
                     var fbError = await fbResponse.Content.ReadAsStringAsync(cancellationToken);
                     _logger.LogWarning("Fallback model '{FallbackModel}' failed with permanent error (HTTP {Status}): {Error}", fallbackModel, fbStatusCode, fbError);
-                    // Throw the PRIMARY model's last transient error
                     throw new GeminiException(lastPrimaryErrorMessage ?? $"Gemini service unavailable (HTTP {lastPrimaryStatusCode}).", lastPrimaryStatusCode ?? 503);
                 }
                 else
@@ -349,6 +321,39 @@ Return the final extraction as a JSON object matching this structure.";
         }
 
         throw new GeminiException(lastPrimaryErrorMessage ?? $"Gemini service unavailable (HTTP {lastPrimaryStatusCode}).", lastPrimaryStatusCode ?? 503);
+    }
+
+    // The new Payload Builder Method
+    private static byte[] BuildPayload(string model, string mimeType, string base64Data)
+    {
+        var generationConfig = new Dictionary<string, object>
+        {
+            ["responseMimeType"] = "application/json",
+            ["temperature"] = 0,
+            ["maxOutputTokens"] = 4096
+        };
+
+        if (model.Contains("gemini-3", StringComparison.OrdinalIgnoreCase))
+            generationConfig["thinkingConfig"] = new { thinkingLevel = "low" };
+        else if (model.Contains("2.5-flash", StringComparison.OrdinalIgnoreCase))
+            generationConfig["thinkingConfig"] = new { thinkingBudget = 0 };
+
+        var payload = new
+        {
+            contents = new[]
+            {
+                new
+                {
+                    parts = new object[]
+                    {
+                        new { inlineData = new { mimeType, data = base64Data } },
+                        new { text = PromptText }
+                    }
+                }
+            },
+            generationConfig
+        };
+        return JsonSerializer.SerializeToUtf8Bytes(payload);
     }
 
     private static bool IsTransientStatusCode(HttpStatusCode statusCode)

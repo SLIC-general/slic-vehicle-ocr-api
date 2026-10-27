@@ -6,6 +6,8 @@ using VehicleOcr.Api.Services;
 // Load .env before building configuration
 Env.TraversePath().Load();
 
+
+
 var builder = WebApplication.CreateBuilder(args);
 
 // Add environment variables to configuration
@@ -62,9 +64,9 @@ builder.Services.AddCors(options =>
 });
 
 // App services
-builder.Services.AddHttpClient<IGeminiClient, GeminiClient>(client =>
+builder.Services.AddHttpClient<IGeminiClient, GeminiClient>(c =>
 {
-    client.Timeout = Timeout.InfiniteTimeSpan;
+    c.Timeout = Timeout.InfiniteTimeSpan;
 });
 
 builder.Services.AddSingleton<IQualityCheckService, QualityCheckService>();
